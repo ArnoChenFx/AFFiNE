@@ -1,0 +1,231 @@
+name: Fork Upstream Sync
+
+# Keeps the fork's release branch on a known-good upstream base, then hands the
+# resulting ref to Fork Image. No fork-specific edit is ever committed on top of
+# an upstream code path: the route-B override is injected at build time.
+#
+# mode=pin (default): rebuild the branch from the upstream release tag, so the
+#   override always meets the revision it was validated against.
+# mode=merge: classic `git merge upstream/<ref>` for people tracking a branch.
+#
+# First run: create the target branch (e.g. fork/stable) and set
+# Settings -> Actions -> General -> Workflow permissions to "Read and write".
+
+on:
+  schedule:
+    - cron: '23 2 * * *' # daily 02:23 UTC
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "'latest' = newest upstream stable tag, or an explicit tag/branch"
+        required: false
+        type: string
+        default: latest
+      target_branch:
+        description: 'fork branch that receives the release'
+        required: false
+        type: string
+        default: fork/stable
+      mode:
+        description: 'pin (rebuild from tag) or merge (pull upstream into the branch)'
+        required: false
+        type: choice
+        options: [pin, merge]
+        default: pin
+      skip_build:
+        description: 'sync only, do not build an image'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: write
+  issues: write
+  packages: write
+
+env:
+  UPSTREAM_REPO: https://github.com/toeverything/AFFiNE.git
+
+jobs:
+  sync:
+    name: Sync upstream
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.result.outputs.ref }}
+      version: ${{ steps.upstream.outputs.version }}
+      build_type: stable
+      should_build: ${{ steps.result.outputs.should_build }}
+    steps:
+      - name: Checkout fork branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.target_branch || 'fork/stable' }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve upstream ref
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream "${UPSTREAM_REPO}" 2>/dev/null || git remote set-url upstream "${UPSTREAM_REPO}"
+          git fetch --tags --prune upstream
+
+          want="${{ inputs.upstream_ref || 'latest' }}"
+          if [ "$want" = "latest" ]; then
+            ref="$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
+          else
+            ref="$want"
+          fi
+          [ -n "$ref" ] || { echo "::error::could not resolve an upstream ref"; exit 1; }
+
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse "${ref}^{commit}")" >> "$GITHUB_OUTPUT"
+          echo "version=${ref#v}" >> "$GITHUB_OUTPUT"
+          echo "upstream: $ref -> $(git rev-parse "${ref}^{commit}")"
+
+      - name: Sync (pin | merge)
+        id: sync
+        shell: bash
+        env:
+          BRANCH: ${{ inputs.target_branch || 'fork/stable' }}
+          MODE: ${{ inputs.mode || 'pin' }}
+          UPSTREAM_REF: ${{ steps.upstream.outputs.ref }}
+          UPSTREAM_COMMIT: ${{ steps.upstream.outputs.commit }}
+        run: |
+          set -euo pipefail
+          git config user.name  'affine-fork-bot'
+          git config user.email 'affine-fork-bot@users.noreply.github.com'
+
+          before="$(git rev-parse HEAD)"
+          echo "before=$before" >> "$GITHUB_OUTPUT"
+
+          if [ "$MODE" = "merge" ]; then
+            if ! git merge --no-commit --no-ff "$UPSTREAM_REF"; then
+              git merge --abort || true
+              echo "::error::merge conflict against $UPSTREAM_REF -- nothing was pushed"
+              exit 1
+            fi
+            git checkout -- . 2>/dev/null || true
+            if [ -f .git/MERGE_HEAD ]; then git commit --no-edit; fi
+          else
+            # pin: everything comes from the upstream tag, the fork-owned files
+            # are carried over (they are pure additions, never upstream code)
+            staging="$(mktemp -d)"
+            keep=(patches tools FORK-CI.md .github/workflows/fork-image.yml .github/workflows/fork-upstream-sync.yml)
+            for p in "${keep[@]}"; do
+              [ -e "$p" ] || continue
+              mkdir -p "$staging/$(dirname "$p")"
+              cp -r "$p" "$staging/$p"
+            done
+
+            git checkout -B "$BRANCH" "$UPSTREAM_COMMIT"
+            for p in "${keep[@]}"; do
+              [ -e "$staging/$p" ] || continue
+              cp -r "$staging/$p" "$(dirname "$p")/"
+            done
+            git add -A
+            git commit -q -m "fork: base upstream ${UPSTREAM_REF} + fork-ci" || true
+          fi
+
+          # nothing changed vs. the current branch tip -> do not churn the branch
+          if git diff --quiet "$before" HEAD; then
+            echo "::notice::already on ${UPSTREAM_REF} with no tree change"
+            git reset -q --hard "$before"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "synced ${BRANCH} to ${UPSTREAM_REF} ($(git rev-parse --short HEAD))"
+          fi
+
+      - name: Verify the override against the new base
+        id: verify
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          bash tools/apply-patches.sh patches 2>&1 | tee /tmp/verify.log
+
+      - name: Roll back when the override is incompatible
+        if: ${{ steps.verify.outcome == 'failure' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::error::route-B override is not compatible with ${{ steps.upstream.outputs.ref }} -- branch left untouched"
+          git reset -q --hard "${{ steps.sync.outputs.before }}"
+
+      - name: Report incompatibility
+        if: ${{ steps.verify.outcome == 'failure' }}
+        uses: actions/github-script@v9
+        env:
+          REF: ${{ steps.upstream.outputs.ref }}
+          TARGET: ${{ inputs.target_branch || 'fork/stable' }}
+        with:
+          script: |
+            const fs = require('fs')
+            let log = ''
+            try { log = fs.readFileSync('/tmp/verify.log', 'utf8').slice(-4000) } catch (e) {}
+            const body = [
+              `Upstream ref: \`${process.env.REF}\``,
+              `Branch: \`${process.env.TARGET}\``,
+              '',
+              'The fork-ci override could not be applied/verified against this upstream revision.',
+              'Nothing was pushed and no image was built.',
+              '',
+              '```',
+              log.trim(),
+              '```',
+              '',
+              `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            ].join('\n')
+            const title = '[fork-sync] route-B override incompatible with upstream'
+            const open = await github.rest.issues.listForRepo({ ...context.repo, state: 'open', labels: 'fork-sync' })
+            if (open.data.length) {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: open.data[0].number, body })
+            } else {
+              await github.rest.issues.create({ ...context.repo, title, body, labels: ['fork-sync'] })
+            }
+
+      - name: Fail when incompatible
+        if: ${{ steps.verify.outcome == 'failure' }}
+        run: exit 1
+
+      - name: Push
+        if: ${{ steps.sync.outputs.changed == 'true' }}
+        shell: bash
+        env:
+          BRANCH: ${{ inputs.target_branch || 'fork/stable' }}
+          MODE: ${{ inputs.mode || 'pin' }}
+        run: |
+          set -euo pipefail
+          if [ "$MODE" = "merge" ]; then
+            git push origin "HEAD:${BRANCH}"
+          else
+            git push --force-with-lease origin "HEAD:${BRANCH}"
+          fi
+
+      - name: Result
+        id: result
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if [ "${{ steps.sync.outputs.changed }}" = "true" ] ||
+            [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  image:
+    name: Build fork image
+    needs: sync
+    if: ${{ needs.sync.outputs.should_build == 'true' && !inputs.skip_build }}
+    uses: ./.github/workflows/fork-image.yml
+    secrets: inherit
+    with:
+      ref: ${{ needs.sync.outputs.ref }}
+      version: ${{ needs.sync.outputs.version }}
+      branch: ${{ inputs.target_branch || 'fork/stable' }}
+      use_upstream_frontend: true
