@@ -18,7 +18,9 @@ export class VersionService {
   async checkVersion(clientVersion?: string) {
     const requiredVersion = this.config.client.versionControl.requiredVersion;
 
-    if (clientVersion && env.namespaces.canary) {
+    // 同 guard.ts：日期版本的识别不依赖 canary namespace（自托管 canary 镜像的前端
+    // 固定发日期版本号，production namespace 下也应按新鲜度放行）
+    if (clientVersion) {
       const canaryCheck = checkCanaryDateClientVersion(clientVersion);
       if (canaryCheck.matched) {
         if (canaryCheck.allowed) {

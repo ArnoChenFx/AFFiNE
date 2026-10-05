@@ -244,7 +244,10 @@ export class AuthGuard implements CanActivate, OnModuleInit {
   ): { ok: true } | { ok: false; requiredVersion: string } {
     const requiredVersion = this.config.client.versionControl.requiredVersion;
 
-    if (clientVersion && env.namespaces.canary) {
+    // 日期版本（YYYY.M.D-canary.N）来自 canary 构建的前端，无论服务端以何种
+    // namespace 运行（自托管 compose 不设 AFFINE_ENV=dev）都按新鲜度放行，
+    // 否则 production namespace 下日期版本会落入 semver 判定被误拒。
+    if (clientVersion) {
       const canaryCheck = checkCanaryDateClientVersion(clientVersion);
       if (canaryCheck.matched) {
         return canaryCheck.allowed

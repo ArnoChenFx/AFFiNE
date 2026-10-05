@@ -48,10 +48,9 @@ function normalizeRealtimeClientVersion(clientVersion: string): string | null {
     return clientVersion;
   }
 
-  if (!env.namespaces.canary) {
-    return null;
-  }
-
+  // 日期版本（YYYY.M.D-canary.N）来自 canary 构建的前端；自托管部署不设
+  // AFFINE_ENV=dev，原实现在此直接返回 null 会导致新鲜版本被
+  // assertVersion 以 >=0.26.0 误拒。改为始终按 62 天新鲜度判定。
   return canaryCheck.allowed ? canaryCheck.normalized : null;
 }
 
