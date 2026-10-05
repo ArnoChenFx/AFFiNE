@@ -1,0 +1,805 @@
+name: Fork Image
+
+# Builds the fork's own image: a *compatible* upstream revision + the route-B
+# override injected at build time. Pushes to ghcr.io/<owner>/affine — never to
+# the upstream namespace.
+#
+# The workspace is pinned to `base_ref` (default: newest upstream stable tag),
+# so the branch you trigger from does not have to match the override's target
+# revision. Nothing is pushed by the pin; it only shapes the build tree.
+
+on:
+  push:
+    branches:
+      - canary
+      - 'fork/**'
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'ref that provides the fork files (empty = the triggering ref)'
+        required: false
+        type: string
+        default: ''
+      base_ref:
+        description: 'upstream ref to build from: latest | tag | branch | none. Empty = the branch .fork-ci.json, else latest'
+        required: false
+        type: string
+        default: ''
+      version:
+        description: 'image version, e.g. 0.27.4 (empty = derived from the base/ref)'
+        required: false
+        type: string
+        default: ''
+      branch:
+        description: 'branch name used for the release tag (empty = the triggering ref)'
+        required: false
+        type: string
+        default: ''
+      platforms:
+        description: 'docker platforms'
+        required: false
+        type: string
+        default: 'linux/amd64'
+      use_upstream_frontend:
+        description: 'reuse the official frontend assets instead of building web/admin/mobile'
+        required: false
+        type: boolean
+        default: true
+      tag_release:
+        description: 'create the release tag + GitHub release after a successful push'
+        required: false
+        type: boolean
+        default: true
+      upstream_tag:
+        description: 'official image tag for the frontend assets: leave EMPTY to auto-match the base ref (canary base -> canary), or force stable/canary'
+        required: false
+        type: string
+        default: ''
+      fill_missing_bindings:
+        description: 'stub native bindings for architectures NOT in `platforms` (the bundle requires all three names); keep true for single-arch builds'
+        required: false
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      ref:
+        required: false
+        type: string
+        default: ''
+      base_ref:
+        required: false
+        type: string
+        default: ''
+      version:
+        required: false
+        type: string
+        default: ''
+      branch:
+        required: false
+        type: string
+        default: ''
+      platforms:
+        required: false
+        type: string
+        default: 'linux/amd64'
+      use_upstream_frontend:
+        required: false
+        type: boolean
+        default: true
+      tag_release:
+        required: false
+        type: boolean
+        default: true
+      upstream_tag:
+        description: 'official image tag for the frontend assets (empty = auto-match the base ref)'
+        required: false
+        type: string
+        default: ''
+      fill_missing_bindings:
+        description: 'stub native bindings for architectures not in `platforms`'
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      AFFINE_PRO_PUBLIC_KEY:
+        required: false
+      AFFINE_PRO_LICENSE_AES_KEY:
+        required: false
+
+permissions:
+  contents: write # required to push the release tag / create the release
+  packages: write
+
+concurrency:
+  group: fork-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_IMAGE: ghcr.io/toeverything/affine
+  UPSTREAM_REPO: https://github.com/toeverything/AFFiNE.git
+
+jobs:
+  # --------------------------------------------------------------------------
+  # pick the base revision, pin the workspace, inject + verify route B
+  # --------------------------------------------------------------------------
+  prepare:
+    name: Prepare + inject
+    runs-on: ubuntu-latest
+    outputs:
+      fork_ref: ${{ steps.forkref.outputs.ref }}
+      base_ref: ${{ steps.base.outputs.base_ref }}
+      version: ${{ steps.version.outputs.version }}
+      build_type: ${{ steps.version.outputs.build_type }}
+      short_sha: ${{ steps.version.outputs.short_sha }}
+      image: ${{ steps.version.outputs.image }}
+      branch: ${{ steps.version.outputs.branch }}
+      branch_slug: ${{ steps.version.outputs.branch_slug }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+      platforms: ${{ steps.version.outputs.platforms }}
+      use_upstream_frontend: ${{ steps.version.outputs.use_upstream_frontend }}
+      override_mode: ${{ steps.override.outputs.mode }}
+      upstream_tag: ${{ steps.base.outputs.upstream_tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve fork-files ref
+        id: forkref
+        shell: bash
+        run: echo "ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Read .fork-ci.json (per-branch role)
+        id: cfg
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f .fork-ci.json ]; then
+            node -e '
+              const fs = require("fs");
+              const cfg = JSON.parse(fs.readFileSync(".fork-ci.json", "utf8"));
+              const lines = [];
+              for (const [k, v] of Object.entries(cfg)) {
+                if (v === null || v === undefined || v === "") continue;
+                lines.push(`${k}=${v}`);
+              }
+              if (lines.length) fs.appendFileSync(process.env.GITHUB_OUTPUT, lines.join("\n") + "\n");
+              console.log("branch role:", JSON.stringify(cfg));
+            '
+          else
+            echo "no .fork-ci.json on this branch (inputs/defaults apply)"
+          fi
+
+      - name: Resolve base ref
+        id: base
+        shell: bash
+        env:
+          BASE_INPUT: ${{ inputs.base_ref }}
+          CFG_BASE: ${{ steps.cfg.outputs.base_ref }}
+          INPUT_UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+          CFG_UPSTREAM_TAG: ${{ steps.cfg.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          want="${BASE_INPUT:-${CFG_BASE:-latest}}"
+          if [ "$want" = "" ] || [ "$want" = "false" ] || [ "$want" = "none" ]; then
+            echo "base_ref=" >> "$GITHUB_OUTPUT"
+            echo "upstream_tag=${INPUT_UPSTREAM_TAG:-${CFG_UPSTREAM_TAG:-stable}}" >> "$GITHUB_OUTPUT"
+            echo "(pinning off: frontend assets default to the official stable image)"
+            echo "pinning disabled; building the triggering ref as-is"
+            exit 0
+          fi
+          if [ "$want" = "latest" ]; then
+            all="$(git ls-remote --tags --refs "${UPSTREAM_REPO}" 'v*' | awk '{print $2}' | sed 's#refs/tags/##')"
+            ref="$(printf '%s\n' "$all" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
+          else
+            ref="$want"
+          fi
+          [ -n "$ref" ] || { echo "::error::could not resolve a base ref"; exit 1; }
+          echo "base_ref=$ref" >> "$GITHUB_OUTPUT"
+          # frontend assets must come from a matching official image
+          # priority: workflow input > .fork-ci.json > auto (canary base -> canary assets)
+          case "$ref" in
+            canary* | master*) tag="${INPUT_UPSTREAM_TAG:-${CFG_UPSTREAM_TAG:-canary}}" ;;
+            *) tag="${INPUT_UPSTREAM_TAG:-${CFG_UPSTREAM_TAG:-stable}}" ;;
+          esac
+          echo "upstream_tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "base ref: $ref (frontend from upstream image tag: $tag)"
+
+      - name: Setup Node.js (for the injector + behaviour check)
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Pin workspace to the base ref
+        uses: ./.github/actions/fork-pin
+        with:
+          base-ref: ${{ steps.base.outputs.base_ref }}
+
+      - name: Apply route-B override (injector + verification)
+        id: override
+        shell: bash
+        run: bash tools/apply-patches.sh patches
+
+      - name: Compute version / branch / build type
+        id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_IMAGE: ${{ github.repository_owner }}
+          INPUT_BRANCH: ${{ inputs.branch || steps.cfg.outputs.branch }}
+          INPUT_PLATFORMS: ${{ inputs.platforms || steps.cfg.outputs.platforms }}
+          INPUT_USE_UPSTREAM: ${{ inputs.use_upstream_frontend }}
+          CFG_USE_UPSTREAM: ${{ steps.cfg.outputs.use_upstream_frontend }}
+          BASE_REF: ${{ steps.base.outputs.base_ref }}
+        run: |
+          set -euo pipefail
+          short_sha="$(git rev-parse --short HEAD)"
+          owner="$(printf '%s' "$INPUT_IMAGE" | tr '[:upper:]' '[:lower:]')"
+          # trigger-agnostic defaults: `inputs` is empty for push/schedule events
+          platforms="${INPUT_PLATFORMS:-linux/amd64,linux/arm64}"
+          use_upstream="${INPUT_USE_UPSTREAM:-${CFG_USE_UPSTREAM:-true}}"
+
+          branch="${INPUT_BRANCH:-}"
+          if [ -z "$branch" ]; then
+            branch="${GITHUB_REF_NAME:-unknown}"
+          fi
+          branch_slug="$(printf '%s' "$branch" | tr '/' '-' | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-')"
+
+          base_version="${BASE_REF#v}"
+          if [ -n "$INPUT_VERSION" ]; then
+            version="$INPUT_VERSION"
+          elif [ -n "$BASE_REF" ] && [[ "$base_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            # pinned to a release tag: the version IS the upstream version
+            version="$base_version"
+          elif [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            # branch base (e.g. base_ref=canary) or no base: date-based canary
+            # version, same shape upstream uses (YYYY.M.D-canary.HHMM)
+            version="$(date -u '+%Y.%-m.%-d-canary.%-H%M')"
+          fi
+
+          if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            build_type=stable
+          elif [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-beta\. ]]; then
+            build_type=beta
+          else
+            build_type=canary
+          fi
+
+          release_tag="${branch_slug}-v${version}"
+
+          {
+            echo "version=$version"
+            echo "build_type=$build_type"
+            echo "short_sha=$short_sha"
+            echo "image=ghcr.io/$owner/affine"
+            echo "branch=$branch"
+            echo "branch_slug=$branch_slug"
+            echo "release_tag=$release_tag"
+            echo "platforms=$platforms"
+            echo "use_upstream_frontend=$use_upstream"
+          } >> "$GITHUB_OUTPUT"
+          echo "version=$version type=$build_type base=${BASE_REF:-none} branch=$branch tag=$release_tag"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Prepare"
+            echo
+            echo "- branch: \`${{ steps.version.outputs.branch }}\`"
+            echo "- fork files: \`${{ steps.forkref.outputs.ref }}\`"
+            echo "- build base: \`${{ steps.base.outputs.base_ref || 'branch as-is' }}\`"
+            echo "- version: \`${{ steps.version.outputs.version }}\` (\`${{ steps.version.outputs.build_type }}\`)"
+            echo "- release tag: \`${{ steps.version.outputs.release_tag }}\`"
+            echo "- override mode: \`${{ steps.override.outputs.mode }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # --------------------------------------------------------------------------
+  # Rust native binding (@affine/server-native) for every platform we ship
+  # --------------------------------------------------------------------------
+  native:
+    name: Native ${{ matrix.file }}
+    needs: prepare
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            file: server-native.x64.node
+          - target: aarch64-unknown-linux-gnu
+            file: server-native.arm64.node
+          - target: armv7-unknown-linux-gnueabihf
+            file: server-native.armv7.node
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.fork_ref }}
+          fetch-depth: 0
+      - uses: ./.github/actions/fork-pin
+        with:
+          base-ref: ${{ needs.prepare.outputs.base_ref }}
+      - name: Setup Version
+        uses: ./.github/actions/setup-version
+        with:
+          app-version: ${{ needs.prepare.outputs.version }}
+      - name: Setup Node.js
+        uses: ./.github/actions/setup-node
+        with:
+          electron-install: false
+          extra-flags: workspaces focus @affine/server-native
+      - name: Build Rust
+        uses: ./.github/actions/build-rust
+        # Optional route A: set these two secrets to bake your own key pair.
+        env:
+          AFFINE_PRO_PUBLIC_KEY: ${{ secrets.AFFINE_PRO_PUBLIC_KEY }}
+          AFFINE_PRO_LICENSE_AES_KEY: ${{ secrets.AFFINE_PRO_LICENSE_AES_KEY }}
+        with:
+          target: ${{ matrix.target }}
+          package: '@affine/server-native'
+      - name: Rename binding
+        run: mv ./packages/backend/native/server-native.node ./packages/backend/native/${{ matrix.file }}
+      - name: Upload binding
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.file }}
+          path: ./packages/backend/native/${{ matrix.file }}
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # server bundle — this is where the route-B override lands in the artifact
+  # --------------------------------------------------------------------------
+  server:
+    name: Build @affine/server
+    needs: [prepare, native]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.fork_ref }}
+          fetch-depth: 0
+      # pin BEFORE installing: yarn must resolve the base revision's deps
+      - uses: ./.github/actions/fork-pin
+        with:
+          base-ref: ${{ needs.prepare.outputs.base_ref }}
+      - name: Setup Node.js
+        uses: ./.github/actions/setup-node
+        with:
+          electron-install: false
+          extra-flags: workspaces focus @affine/server @types/affine__env
+      - name: Setup Version
+        uses: ./.github/actions/setup-version
+        with:
+          app-version: ${{ needs.prepare.outputs.version }}
+      - name: Apply route-B override (injector + verification)
+        id: override
+        run: bash tools/apply-patches.sh patches
+      - name: Download native bindings
+        uses: actions/download-artifact@v4
+        with:
+          pattern: server-native.*.node
+          merge-multiple: true
+          path: ./packages/backend/native
+      - name: Verify native bindings cover the built platforms
+        id: bindings
+        shell: bash
+        env:
+          PLATFORMS: ${{ needs.prepare.outputs.platforms }}
+          FILL: ${{ inputs.fill_missing_bindings != false }}
+        run: |
+          set -euo pipefail
+          echo "platforms: $PLATFORMS"
+          echo "native dir:"; ls -alh ./packages/backend/native | sed -n '1,20p'
+
+          # packages/backend/native/index.js statically requires all three names,
+          # so the bundler needs the file to exist for EVERY entry, shipped or not
+          rc=0
+          for pair in \
+            "amd64:server-native.x64.node:linux/amd64" \
+            "arm64:server-native.arm64.node:linux/arm64" \
+            "armv7:server-native.armv7.node:linux/arm/v7"; do
+            f="${pair#*:}"; f="${f%%:*}"
+            plat="${pair##*:}"
+            shipped=false
+            case ",$PLATFORMS," in *",$plat,"*) shipped=true ;; esac
+            if [ -f "packages/backend/native/$f" ]; then
+              echo "  ok        $f"
+            elif [ "$shipped" = "true" ]; then
+              echo "::error::missing packages/backend/native/$f but this build ships $plat -- re-enable that target in the native matrix (server-native.x64/arm64/armv7)"
+              rc=1
+            elif [ "$FILL" = "true" ]; then
+              # not shipped by this build, therefore never required at runtime:
+              # a stub keeps the bundler happy without shipping wrong arch bytes
+              printf '// fork-ci stub: %s not built (platforms=%s)\nmodule.exports = {};\n' "$f" "$PLATFORMS" \
+                > "packages/backend/native/$f"
+              echo "::notice::stubbed $f ($plat is not in platforms)"
+            else
+              echo "::error::missing packages/backend/native/$f and stubbing is disabled"
+              rc=1
+            fi
+          done
+          [ "$rc" -eq 0 ] || exit 1
+          echo "bindings ready"; ls -alh ./packages/backend/native | sed -n '1,20p'
+      - name: Build server
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          yarn workspace @affine/server build 2>&1 | tee /tmp/server-build.log
+
+          dist=""
+          if [ -d packages/backend/server/dist ] && [ -n "$(ls -A packages/backend/server/dist)" ]; then
+            dist="packages/backend/server/dist"
+          else
+            echo "::notice::packages/backend/server/dist is missing after a successful build; locating the bundle"
+            candidate="$(find packages/backend/server -type d -name dist -not -path '*/node_modules/*' 2>/dev/null | head -1 || true)"
+            if [ -n "$candidate" ] && [ -f "$candidate/main.js" ]; then
+              dist="$candidate"
+            fi
+          fi
+
+          if [ -z "$dist" ]; then
+            echo "::error::the bundler produced no server bundle (build exited 0 but wrote nothing)"
+            echo "---- last 40 lines of the build output ----"
+            tail -40 /tmp/server-build.log || true
+            echo "---- packages/backend/server ----"
+            ls -la packages/backend/server | sed -n '1,30p' || true
+            echo "---- any dist dirs under packages/backend/server ----"
+            find packages/backend/server -type d -name dist -not -path '*/node_modules/*' 2>/dev/null | head || true
+            exit 1
+          fi
+
+          echo "dist=$dist" >> "$GITHUB_OUTPUT"
+          echo "server bundle: $dist ($(find "$dist" -type f | wc -l) files)"
+
+      - name: Assert the override is effective for this mode
+        shell: bash
+        env:
+          MODE: ${{ needs.prepare.outputs.override_mode }}
+          DIST: ${{ steps.build.outputs.dist || 'packages/backend/server/dist' }}
+        run: |
+          set -euo pipefail
+          echo "checking bundle at: $DIST"
+          if [ "$MODE" = "hook" ]; then
+            # the TS hook must be inside the bundle that actually ships
+            grep -rq "forkIsSelfhosted" "$DIST" ||
+              { echo "::error::route-B hook (forkIsSelfhosted) not found in $DIST"; exit 1; }
+            echo "hook mode: injection verified inside $DIST"
+          elif [ "$MODE" = "license" ]; then
+            # this revision resolves entitlements in the runtime, so a license can
+            # only be installed if OUR public key was baked into the binding
+            node -e '
+              const b = require("./packages/backend/native");
+              const key = b.AFFINE_PRO_PUBLIC_KEY;
+              if (!key) {
+                console.error("::error::AFFINE_PRO_PUBLIC_KEY is not embedded in the binding -- the instance could never install a license. Set the AFFINE_PRO_PUBLIC_KEY repository secret (your own P-256 public key PEM) and rebuild.");
+                process.exit(1);
+              }
+              console.log("license mode: embedded public key present:", String(key).split("\n")[1]?.slice(0, 24) + "...");
+            '
+          else
+            echo "::warning::unknown override mode '$MODE'"
+          fi
+      - name: Upload server dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-dist
+          # upload from wherever the bundler actually wrote it; the image job
+          # restores it into packages/backend/server/dist, which is what the
+          # Dockerfile COPYs
+          path: ${{ steps.build.outputs.dist || 'packages/backend/server/dist' }}
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # frontend assets: reuse the official image (no secrets needed) or build them
+  # --------------------------------------------------------------------------
+  assets:
+    name: Frontend assets
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.fork_ref }}
+          fetch-depth: 0
+      - uses: ./.github/actions/fork-pin
+        with:
+          base-ref: ${{ needs.prepare.outputs.base_ref }}
+
+      - name: Pull upstream image and extract static assets
+        if: ${{ needs.prepare.outputs.use_upstream_frontend == 'true' }}
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.prepare.outputs.upstream_tag || 'stable' }}
+        run: |
+          set -euo pipefail
+          docker pull "${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+          id="$(docker create "${UPSTREAM_IMAGE}:${UPSTREAM_TAG}")"
+          mkdir -p packages/frontend/apps/web/dist packages/frontend/admin/dist packages/frontend/apps/mobile/dist
+          docker cp "$id:/app/static/." packages/frontend/apps/web/dist
+          docker cp "$id:/app/static/admin/." packages/frontend/admin/dist
+          docker cp "$id:/app/static/mobile/." packages/frontend/apps/mobile/dist
+          docker rm "$id"
+          ls -alh packages/frontend/apps/web/dist | head
+
+      - name: Setup Version
+        if: ${{ needs.prepare.outputs.use_upstream_frontend != 'true' }}
+        uses: ./.github/actions/setup-version
+        with:
+          app-version: ${{ needs.prepare.outputs.version }}
+      - name: Setup Node.js
+        if: ${{ needs.prepare.outputs.use_upstream_frontend != 'true' }}
+        uses: ./.github/actions/setup-node
+      - name: Build web / admin / mobile
+        if: ${{ needs.prepare.outputs.use_upstream_frontend != 'true' }}
+        shell: bash
+        env:
+          BUILD_TYPE: ${{ needs.prepare.outputs.build_type }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: |
+          yarn affine @affine/web build
+          yarn affine @affine/admin build
+          yarn affine @affine/mobile build
+
+      # NOTE: upload-artifact stores one path relative to that path itself, so a
+      # single artifact with three paths would lose the directory structure
+      # (the Dockerfile COPYs ./packages/frontend/...). One artifact per dist.
+      - name: Upload web dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-web
+          path: packages/frontend/apps/web/dist
+          if-no-files-found: error
+      - name: Upload admin dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-admin
+          path: packages/frontend/admin/dist
+          if-no-files-found: error
+      - name: Upload mobile dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-mobile
+          path: packages/frontend/apps/mobile/dist
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # assemble + push ghcr.io/<owner>/affine
+  # --------------------------------------------------------------------------
+  image:
+    name: Push image
+    needs: [prepare, server, assets]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.fork_ref }}
+          fetch-depth: 0
+      - uses: ./.github/actions/fork-pin
+        with:
+          base-ref: ${{ needs.prepare.outputs.base_ref }}
+
+      - name: Download server dist
+        uses: actions/download-artifact@v4
+        with:
+          name: server-dist
+          path: ./packages/backend/server/dist
+
+      - name: Download web dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-web
+          path: ./packages/frontend/apps/web/dist
+      - name: Download admin dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-admin
+          path: ./packages/frontend/admin/dist
+      - name: Download mobile dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-mobile
+          path: ./packages/frontend/apps/mobile/dist
+
+      - name: Setup Version
+        uses: ./.github/actions/setup-version
+        with:
+          app-version: ${{ needs.prepare.outputs.version }}
+
+      - name: Assert the docker build context is complete
+        shell: bash
+        run: |
+          set -euo pipefail
+          # exactly what .github/deployment/node/Dockerfile COPYs
+          fail=0
+          for d in packages/backend/server/dist \
+                   packages/frontend/apps/web/dist \
+                   packages/frontend/admin/dist \
+                   packages/frontend/apps/mobile/dist; do
+            if [ -d "$d" ] && [ -n "$(ls -A "$d" 2>/dev/null)" ]; then
+              echo "  ok   $d ($(find "$d" -type f | wc -l) files)"
+            else
+              echo "::error::missing or empty build-context path: $d"
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || { echo "::error::frontend/server artifacts were not restored with the layout the Dockerfile expects"; exit 1; }
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: '.nvmrc'
+          registry-url: https://npm.pkg.github.com
+          scope: '@toeverything'
+
+      - name: Install production dependencies
+        run: |
+          yarn config set --json supportedArchitectures.cpu '["x64", "arm64", "arm"]'
+          yarn config set --json supportedArchitectures.libc '["glibc"]'
+          yarn workspaces focus @affine/server --production
+
+      - name: Generate Prisma client
+        run: yarn workspace @affine/server prisma generate
+
+      - name: Move node_modules next to the server package
+        run: mv ./node_modules ./packages/backend/server
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ needs.prepare.outputs.image }}
+          tags: |
+            type=raw,value=${{ needs.prepare.outputs.version }}
+            type=raw,value=${{ needs.prepare.outputs.build_type }}
+            type=raw,value=${{ needs.prepare.outputs.build_type }}-${{ needs.prepare.outputs.short_sha }}
+            type=raw,value=${{ needs.prepare.outputs.branch_slug }}
+            type=raw,value=${{ needs.prepare.outputs.release_tag }}
+            type=raw,value=latest,enable=${{ needs.prepare.outputs.build_type == 'stable' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: .github/deployment/node/Dockerfile
+          push: true
+          pull: true
+          platforms: ${{ needs.prepare.outputs.platforms }}
+          provenance: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Summary
+        run: |
+          {
+            echo "### Fork image pushed"
+            echo
+            echo "- build base: \`${{ needs.prepare.outputs.base_ref || 'branch as-is' }}\`"
+            echo "- branch: \`${{ needs.prepare.outputs.branch }}\`"
+            echo "- release tag: \`${{ needs.prepare.outputs.release_tag }}\`"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # --------------------------------------------------------------------------
+  # release tag carrying the branch name: <branch>-v<version>
+  # (only after the image was pushed successfully)
+  # --------------------------------------------------------------------------
+  release:
+    name: Tag release
+    needs: [prepare, image]
+    # inputs is empty on push events -> treat as the default (true)
+    if: ${{ github.ref_type != 'tag' && inputs.tag_release != false }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.fork_ref }}
+          fetch-depth: 0
+
+      - name: Create and push the branch tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'affine-fork-bot'
+          git config user.email 'affine-fork-bot@users.noreply.github.com'
+          git fetch --tags --force origin
+
+          base="${{ needs.prepare.outputs.release_tag }}"
+          target="${{ needs.prepare.outputs.fork_ref }}"
+          tag="$base"
+          n=1
+
+          while git rev-parse -q --verify "refs/tags/$tag" >/dev/null; do
+            if [ "$(git rev-list -n 1 "$tag")" = "$target" ]; then
+              echo "::notice::tag $tag already points at $target; nothing to do"
+              echo "tag=$tag" >> "$GITHUB_OUTPUT"
+              echo "created=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            n=$((n + 1))
+            tag="$base.$n"
+          done
+
+          cat > tag-message.txt <<'TAGMSG'
+          AFFiNE fork image ${{ needs.prepare.outputs.release_tag }}
+
+          branch: ${{ needs.prepare.outputs.branch }}
+          build base: ${{ needs.prepare.outputs.base_ref || 'branch as-is' }}
+          version: ${{ needs.prepare.outputs.version }} (${{ needs.prepare.outputs.build_type }})
+          image: ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.release_tag }}
+          TAGMSG
+
+          git tag -a "$tag" -F tag-message.txt "$target"
+          git push origin "refs/tags/$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+          echo "pushed tag $tag -> $target"
+
+      - name: Create GitHub release
+        if: ${{ steps.tag.outputs.created == 'true' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<'NOTES'
+          AFFiNE fork build — route-B self-hosted entitlement override baked in.
+
+          - branch: `${{ needs.prepare.outputs.branch }}`
+          - build base: `${{ needs.prepare.outputs.base_ref || 'branch as-is' }}`
+          - version: `${{ needs.prepare.outputs.version }}` (`${{ needs.prepare.outputs.build_type }}`)
+          - override mode: `${{ needs.prepare.outputs.override_mode }}` (hook = patched TS orchestration, license = built-in key pair + issued license)
+          - image: `${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.release_tag }}`
+          - also tagged: `:${{ needs.prepare.outputs.build_type }}`, `:latest` (stable only),
+            `:${{ needs.prepare.outputs.version }}`, `:${{ needs.prepare.outputs.short_sha }}`,
+            `:${{ needs.prepare.outputs.branch_slug }}`
+
+          Pull:
+          ```bash
+          docker pull ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.release_tag }}
+          ```
+          NOTES
+
+          gh release create "$TAG" \
+            --target "${{ needs.prepare.outputs.fork_ref }}" \
+            --title "$TAG" \
+            --notes-file release-notes.md
+
+      - name: Summary
+        run: |
+          {
+            echo "### Release tag"
+            echo
+            echo "- git tag: \`${{ steps.tag.outputs.tag }}\`"
+            echo "- branch: \`${{ needs.prepare.outputs.branch }}\`"
+            echo "- image: \`${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.release_tag }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

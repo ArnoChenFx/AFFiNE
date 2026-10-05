@@ -1,0 +1,110 @@
+name: 'Fork pin'
+description: >
+  Re-base the build workspace onto a compatible upstream ref (tag/branch) while
+  carrying the fork-owned files (tools/, patches/, FORK-CI.md, this action).
+  Nothing is pushed: the pin only affects the job's working tree, so a branch
+  that happens to sit on an incompatible revision can still produce a release.
+
+inputs:
+  base-ref:
+    description: 'upstream ref (tag or branch) to build from'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Pin workspace to base
+      shell: bash
+      env:
+        BASE_REF: ${{ inputs.base-ref }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "$BASE_REF" ]; then
+          echo "no base-ref given; nothing to pin"
+          exit 0
+        fi
+
+        current="$(git rev-parse HEAD)"
+        if git rev-parse -q --verify "${BASE_REF}^{commit}" >/dev/null &&
+          [ "$(git rev-parse "${BASE_REF}^{commit}")" = "$current" ]; then
+          echo "already on ${BASE_REF} (${current:0:7}); nothing to pin"
+          exit 0
+        fi
+        if [ "$BASE_REF" = "$current" ] || [ "$BASE_REF" = "${GITHUB_REF_NAME:-}" ]; then
+          echo "already based on ${BASE_REF}; nothing to pin"
+          exit 0
+        fi
+
+        # 1. make sure the base ref resolves BEFORE touching the tree.
+        #    BASE_REF may be a tag (v0.27.4) or a branch (canary), and the branch
+        #    is not necessarily checked out here, so try several resolutions.
+        resolve_base() {
+          local r
+          for r in "$BASE_REF" "refs/tags/$BASE_REF" "origin/$BASE_REF" "refs/remotes/origin/$BASE_REF" \
+                   "upstream/$BASE_REF" "refs/remotes/upstream/$BASE_REF"; do
+            if git rev-parse -q --verify "${r}^{commit}" >/dev/null 2>&1; then
+              git rev-parse "${r}^{commit}"
+              return 0
+            fi
+          done
+          return 1
+        }
+        fetch_base() { # $1 = remote
+          git fetch --tags --force "$1" 2>/dev/null || true
+          git fetch --force "$1" "refs/heads/${BASE_REF}:refs/remotes/$1/${BASE_REF}" 2>/dev/null || true
+        }
+
+        base_commit="$(resolve_base || true)"
+        if [ -z "$base_commit" ]; then
+          fetch_base origin
+          base_commit="$(resolve_base || true)"
+        fi
+        if [ -z "$base_commit" ]; then
+          echo "resolving ${BASE_REF} from upstream"
+          git remote add upstream https://github.com/toeverything/AFFiNE.git 2>/dev/null ||
+            git remote set-url upstream https://github.com/toeverything/AFFiNE.git
+          fetch_base upstream
+          base_commit="$(resolve_base || true)"
+        fi
+        [ -n "$base_commit" ] ||
+          { echo "::error::base ref '${BASE_REF}' not found as a tag or branch in origin/upstream"; exit 1; }
+
+        # 2. move the fork-owned paths aside (restored on any exit)
+        staging="$(mktemp -d)"
+        keep=(
+          patches
+          tools
+          FORK-CI.md
+          .github/actions
+          .github/workflows/fork-image.yml
+          .github/workflows/fork-upstream-sync.yml
+        )
+
+        restore() {
+          local p
+          for p in "${keep[@]}"; do
+            [ -e "$staging/$p" ] || continue
+            mkdir -p "$(dirname "$p")"
+            rm -rf "$p"
+            cp -r "$staging/$p" "$(dirname "$p")/"
+          done
+          chmod +x tools/apply-patches.sh 2>/dev/null || true
+        }
+        trap restore EXIT
+
+        local_p=""
+        for local_p in "${keep[@]}"; do
+          [ -e "$local_p" ] || continue
+          mkdir -p "$staging/$(dirname "$local_p")"
+          cp -r "$local_p" "$staging/$local_p"
+          rm -rf "$local_p"
+        done
+
+        # 3. switch the tree to the base commit, then restore the fork paths
+        git checkout --detach "$base_commit"
+        restore
+        trap - EXIT
+
+        echo "pinned to ${BASE_REF} (${base_commit:0:7})"
+        echo "fork files: $(ls -d patches tools FORK-CI.md .github/actions/fork-pin 2>/dev/null | tr '\n' ' ')"
