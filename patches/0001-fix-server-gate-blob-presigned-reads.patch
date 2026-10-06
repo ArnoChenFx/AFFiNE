@@ -1,0 +1,169 @@
+diff --git a/packages/backend/server/src/core/storage-runtime/provider.ts b/packages/backend/server/src/core/storage-runtime/provider.ts
+index 4ff84221f..c658007d4 100644
+--- a/packages/backend/server/src/core/storage-runtime/provider.ts
++++ b/packages/backend/server/src/core/storage-runtime/provider.ts
+@@ -13,6 +13,8 @@ import type {
+   ListObjectsMetadata,
+   PresignedUpload,
+   PutObjectMetadata,
++  S3StorageConfig,
++  StorageProviderConfig,
+ } from '../../base';
+ import { Config, OnEvent } from '../../base';
+ import { wrapCallMetric } from '../../base/metrics';
+@@ -25,6 +27,7 @@ import {
+   StorageRuntime,
+   type StorageRuntimeHealth,
+ } from '../../native';
++import type { Storages } from '../storage/config';
+ 
+ type RuntimeInstance = InstanceType<typeof StorageRuntime>;
+ 
+@@ -138,12 +141,89 @@ export class StorageRuntimeProvider
+   }
+ 
+   async presignGet(scope: string, key: string) {
++    // Self-hosted instances usually cannot expose the object storage endpoint
++    // to browsers, so a presigned redirect leaks an internal host (for example
++    // `http://minio:9000`) and the client fails to load the object.
++    //
++    // `usePresignedURL.enabled` already gates the upload path through
++    // WorkspaceBlobStorage.uploadURLConfig(); gate the read path with the same
++    // switch so operators can choose server-mediated streaming. Returning
++    // undefined makes the caller stream the object through this process
++    // instead of redirecting the browser to object storage.
++    if (!this.presignedReadEnabled(scope)) {
++      return undefined;
++    }
++    const result = await this.measured('presignGet', rt =>
++      rt.presignGet(scope, key)
++    );
++    return result ? fromRuntimePresigned(result) : undefined;
++  }
++
++  /**
++   * Reads may redirect to object storage only when the deployment explicitly
++   * enables presigned URLs for the scope that serves the object. Any other
++   * provider (or an absent flag) streams the response through the server,
++   * which is what a self-hosted deployment needs when object storage is not
++   * reachable from the browser.
++   *
++   * Note: this only governs the browser-facing redirect path. Server-to-server
++   * consumers that need a machine-readable URL (for example the transcript
++   * service handing audio to a speech provider) must use
++   * `presignGetForServer` instead of relying on this gate.
++   */
++  private presignedReadEnabled(scope: string): boolean {
++    const storage = this.scopeStorageConfig(scope);
++    if (!storage) {
++      // Unknown scope: never leak an endpoint. Streaming is always safe.
++      return false;
++    }
++    if (
++      storage.provider !== 'aws-s3' &&
++      storage.provider !== 'cloudflare-r2'
++    ) {
++      return false;
++    }
++    return (
++      (storage.config as S3StorageConfig).usePresignedURL?.enabled === true
++    );
++  }
++
++  /**
++   * Always return a presigned URL, regardless of `usePresignedURL.enabled`.
++   *
++   * Use this for server-to-server flows where the URL is consumed by another
++   * backend rather than a browser. The URL must still be reachable from that
++   * backend, so callers stay responsible for the endpoint being appropriate.
++   */
++  async presignGetForServer(scope: string, key: string) {
+     const result = await this.measured('presignGet', rt =>
+       rt.presignGet(scope, key)
+     );
+     return result ? fromRuntimePresigned(result) : undefined;
+   }
+ 
++  /**
++   * Resolve the storage provider config for a runtime scope. The runtime reads
++   * `storages.blob.storage` / `storages.avatar.storage`, and the copilot scope
++   * reads `copilot.storage`.
++   */
++  private scopeStorageConfig(
++    scope: string
++  ): StorageProviderConfig | undefined {
++    const storages = this.config.storages as Storages | undefined;
++    if (scope === 'copilot') {
++      const copilot = this.config.copilot as
++        | { storage?: StorageProviderConfig }
++        | undefined;
++      return copilot?.storage;
++    }
++    if (scope === 'avatar') {
++      return storages?.avatar?.storage;
++    }
++    // The runtime falls back to the blob backend for every other scope.
++    return storages?.blob?.storage;
++  }
++
+   async createMultipartUpload(
+     scope: string,
+     key: string,
+diff --git a/packages/backend/server/src/plugins/copilot/storage.ts b/packages/backend/server/src/plugins/copilot/storage.ts
+index e7f3b5891..2a4bd3241 100644
+--- a/packages/backend/server/src/plugins/copilot/storage.ts
++++ b/packages/backend/server/src/plugins/copilot/storage.ts
+@@ -65,12 +65,36 @@ export class CopilotStorage {
+     return this.rt.getObject('copilot', name);
+   }
+ 
++  /**
++   * Browser-facing presign. Gated by `usePresignedURL.enabled`: when the
++   * deployment does not opt in, this returns undefined and the caller streams
++   * the object through the server instead of redirecting to an endpoint the
++   * browser may not reach.
++   */
+   async presignGet(userId: string, workspaceId: string, key: string) {
+     return (
+       await this.rt.presignGet('copilot', `${userId}/${workspaceId}/${key}`)
+     )?.url;
+   }
+ 
++  /**
++   * Server-to-server presign. The returned URL is handed to an external
++   * service (for example a speech provider), not to a browser, so it stays
++   * available even when browser redirects are disabled for self-hosted use.
++   */
++  async presignGetForExternalService(
++    userId: string,
++    workspaceId: string,
++    key: string
++  ) {
++    return (
++      await this.rt.presignGetForServer(
++        'copilot',
++        `${userId}/${workspaceId}/${key}`
++      )
++    )?.url;
++  }
++
+   keyFromUrl(userId: string, workspaceId: string, url: string) {
+     try {
+       const parsed = new URL(url);
+diff --git a/packages/backend/server/src/plugins/copilot/transcript/service.ts b/packages/backend/server/src/plugins/copilot/transcript/service.ts
+index 7103a7ac4..323ae1936 100644
+--- a/packages/backend/server/src/plugins/copilot/transcript/service.ts
++++ b/packages/backend/server/src/plugins/copilot/transcript/service.ts
+@@ -140,7 +140,11 @@ export class CopilotTranscriptionService {
+       throw new Error('Transcript attachment cannot be resolved');
+     }
+ 
+-    const signedUrl = await this.storage.presignGet(userId, workspaceId, key);
++    const signedUrl = await this.storage.presignGetForExternalService(
++      userId,
++      workspaceId,
++      key
++    );
+     if (!signedUrl) {
+       throw new Error('Transcript attachment signing is not configured');
+     }
