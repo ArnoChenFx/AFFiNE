@@ -1,0 +1,70 @@
+From da7d34f70775d545b45e380863a1f5ae9c89f6b5 Mon Sep 17 00:00:00 2001
+From: fork-ci <fork-ci@local>
+Date: Tue, 6 Oct 2026 03:32:30 +0800
+Subject: [PATCH] fix(server): allow canary date client versions regardless of
+ namespace
+
+Self-hosted deployments run with NAMESPACE=production (no AFFINE_ENV=dev),
+so the canary-date fast path in AuthGuard / VersionService / RealtimeGateway
+never engaged and fresh date-based client versions (YYYY.M.D-canary.N) from
+canary web builds fell through to the semver ranges and were rejected with
+'>=0.26.0'. The date-format recognition and 62-day freshness window do not
+actually depend on the server namespace; engage them unconditionally.
+---
+ packages/backend/server/src/core/auth/guard.ts       | 5 ++++-
+ packages/backend/server/src/core/realtime/gateway.ts | 7 +++----
+ packages/backend/server/src/core/version/service.ts  | 4 +++-
+ 3 files changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/packages/backend/server/src/core/auth/guard.ts b/packages/backend/server/src/core/auth/guard.ts
+index af8028795..94111ef1d 100644
+--- a/packages/backend/server/src/core/auth/guard.ts
++++ b/packages/backend/server/src/core/auth/guard.ts
+@@ -244,7 +244,10 @@ export class AuthGuard implements CanActivate, OnModuleInit {
+   ): { ok: true } | { ok: false; requiredVersion: string } {
+     const requiredVersion = this.config.client.versionControl.requiredVersion;
+ 
+-    if (clientVersion && env.namespaces.canary) {
++    // 日期版本（YYYY.M.D-canary.N）来自 canary 构建的前端，无论服务端以何种
++    // namespace 运行（自托管 compose 不设 AFFINE_ENV=dev）都按新鲜度放行，
++    // 否则 production namespace 下日期版本会落入 semver 判定被误拒。
++    if (clientVersion) {
+       const canaryCheck = checkCanaryDateClientVersion(clientVersion);
+       if (canaryCheck.matched) {
+         return canaryCheck.allowed
+diff --git a/packages/backend/server/src/core/realtime/gateway.ts b/packages/backend/server/src/core/realtime/gateway.ts
+index 13c3fce15..72db1efef 100644
+--- a/packages/backend/server/src/core/realtime/gateway.ts
++++ b/packages/backend/server/src/core/realtime/gateway.ts
+@@ -48,10 +48,9 @@ function normalizeRealtimeClientVersion(clientVersion: string): string | null {
+     return clientVersion;
+   }
+ 
+-  if (!env.namespaces.canary) {
+-    return null;
+-  }
+-
++  // 日期版本（YYYY.M.D-canary.N）来自 canary 构建的前端；自托管部署不设
++  // AFFINE_ENV=dev，原实现在此直接返回 null 会导致新鲜版本被
++  // assertVersion 以 >=0.26.0 误拒。改为始终按 62 天新鲜度判定。
+   return canaryCheck.allowed ? canaryCheck.normalized : null;
+ }
+ 
+diff --git a/packages/backend/server/src/core/version/service.ts b/packages/backend/server/src/core/version/service.ts
+index 861171469..0cbdf8968 100644
+--- a/packages/backend/server/src/core/version/service.ts
++++ b/packages/backend/server/src/core/version/service.ts
+@@ -18,7 +18,9 @@ export class VersionService {
+   async checkVersion(clientVersion?: string) {
+     const requiredVersion = this.config.client.versionControl.requiredVersion;
+ 
+-    if (clientVersion && env.namespaces.canary) {
++    // 同 guard.ts：日期版本的识别不依赖 canary namespace（自托管 canary 镜像的前端
++    // 固定发日期版本号，production namespace 下也应按新鲜度放行）
++    if (clientVersion) {
+       const canaryCheck = checkCanaryDateClientVersion(clientVersion);
+       if (canaryCheck.matched) {
+         if (canaryCheck.allowed) {
+-- 
+2.56.0.windows.1
+
