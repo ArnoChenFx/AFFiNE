@@ -54,8 +54,21 @@ export class BackendRuntimeCoreOperations {
     return this.runtime.copilotEnabled();
   }
 
+  getCopilotRouteOptions(promptName: string) {
+    return this.runtime.getCopilotRouteOptions(promptName);
+  }
+
   nodeCryptoPrivateKey() {
     return this.runtime.nodeCryptoPrivateKey();
+  }
+
+  listPaymentSubscriptionsV1<T>(
+    targetType: 'user' | 'workspace',
+    targetId: string
+  ) {
+    return this.measured('listPaymentSubscriptionsV1', runtime =>
+      runtime.listPaymentSubscriptionsV1(targetType, targetId)
+    ) as Promise<T>;
   }
 
   executePaymentCommandV1<T = unknown>(input: Record<string, unknown>) {

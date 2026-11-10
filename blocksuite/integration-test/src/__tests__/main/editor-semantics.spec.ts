@@ -1,7 +1,12 @@
+import {
+  DatabaseBlockDataSource,
+  databaseBlockProperties,
+} from '@blocksuite/affine-block-database';
 import { LinkExtension } from '@blocksuite/affine-inline-link';
 import { textKeymap } from '@blocksuite/affine-inline-preset';
 import type { AffineReference } from '@blocksuite/affine-inline-reference';
 import type {
+  DatabaseBlockModel,
   EmbedYoutubeModel,
   ListBlockModel,
   ParagraphBlockModel,
@@ -9,11 +14,15 @@ import type {
 import { insertContent } from '@blocksuite/affine-rich-text';
 import { REFERENCE_NODE } from '@blocksuite/affine-shared/consts';
 import { createDefaultDoc } from '@blocksuite/affine-shared/utils';
-import { TextSelection } from '@blocksuite/std';
+import type { SingleViewBase } from '@blocksuite/data-view';
+import { SurfaceSelection, TextSelection } from '@blocksuite/std';
 import type { InlineMarkdownMatch } from '@blocksuite/std/inline';
 import { Text } from '@blocksuite/store';
 import { beforeEach, describe, expect, test, vi } from 'vitest';
 
+import type { DatabaseTitle } from '../../../../affine/blocks/database/src/components/title/index.js';
+import type { TableBlockComponent } from '../../../../affine/blocks/table/src/table-block.js';
+import type { TableCell } from '../../../../affine/blocks/table/src/table-cell.js';
 import { defaultSlashMenuConfig } from '../../../../affine/widgets/slash-menu/src/config.js';
 import type {
   SlashMenuActionItem,
@@ -178,6 +187,103 @@ test.each([false, true])(
     model.yBlock.set('prop:url', 'https://www.youtube.com/watch?v=second');
     expect(model.props.videoId).toBe(readonly ? 'first' : 'second');
     detached.readonly = false;
+  }
+);
+
+test.each(['page', 'edgeless'] as const)(
+  'table selection preserves its input owner in %s mode',
+  async mode => {
+    await setupEditor(mode);
+    const noteId = addNote(doc);
+    const tableId = doc.addBlock(
+      'affine:table',
+      {
+        rows: { row: { rowId: 'row', order: 'a0' } },
+        columns: { column: { columnId: 'column', order: 'a0' } },
+        cells: { 'row:column': { text: new Text('abc') } },
+      },
+      noteId
+    );
+    await wait();
+    const table = editor.host!.view.getBlock(tableId) as TableBlockComponent;
+    const cell = table.querySelector('affine-table-cell') as TableCell;
+    const surfaceSelection = new SurfaceSelection(
+      doc.getModelsByFlavour('affine:surface')[0].id,
+      [noteId],
+      true
+    );
+    if (mode === 'edgeless') {
+      editor.std.selection.setGroup('gfx', [surfaceSelection]);
+    }
+    cell.inlineEditor!.focusEnd();
+    await wait();
+    cell.text!.insert('xyz', 3);
+    await wait();
+    expect(cell.text!.toString()).toBe('abcxyz');
+    expect(table.selectionController.getSelected()?.type).toBe('area');
+    expect(editor.std.selection.getGroup('gfx')).toEqual(
+      mode === 'edgeless' ? [surfaceSelection] : []
+    );
+    table.selectionController.setSelected({
+      type: 'column',
+      columnId: 'column',
+    });
+    table.selectionController.setSelected(undefined);
+    expect(table.selectionController.getSelected()).toBeUndefined();
+    expect(editor.std.selection.getGroup('gfx')).toEqual(
+      mode === 'edgeless' ? [surfaceSelection] : []
+    );
+  }
+);
+
+test.each(
+  Object.values(databaseBlockProperties).filter(
+    property => !['title', 'created-time'].includes(property.type)
+  )
+)(
+  'database isolates malformed $type cells without changing persisted values',
+  async property => {
+    const noteId = addNote(doc);
+    const id = doc.addBlock('affine:database', {}, noteId);
+    const model = doc.getModelById(id) as DatabaseBlockModel;
+    const source = new DatabaseBlockDataSource(model);
+    source.viewManager.viewAdd('table');
+    const propertyId = source.propertyAdd('end', { type: property.type })!;
+    const malformedRow = source.rowAdd('end');
+    const normalRow = source.rowAdd('end');
+    await wait();
+    const database = editor.host!.view.getBlock(id)!;
+    await database.updateComplete;
+    const title = database.querySelector<DatabaseTitle>(
+      'affine-database-title'
+    )!;
+    await title.updateComplete;
+    expect(title.querySelector('textarea')).not.toBeNull();
+    const defaultValue = property.config.rawValue.default();
+    source.cellValueChange(normalRow, propertyId, defaultValue);
+    expect(source.cellValueGet(normalRow, propertyId)).toEqual(defaultValue);
+    const invalidValue = { legacy: 'invalid' };
+    doc.updateBlock(model, {
+      cells: {
+        ...model.props.cells,
+        [malformedRow]: {
+          [propertyId]: { columnId: propertyId, value: invalidValue },
+        },
+      },
+    });
+    expect(source.cellValueGet(malformedRow, propertyId)).toEqual(defaultValue);
+    expect(model.props.cells[malformedRow][propertyId].value).toEqual(
+      invalidValue
+    );
+    const normal = doc.getModelById(normalRow) as ParagraphBlockModel;
+    normal.props.text.insert('needle', 0);
+    const view = source.viewManager.currentView$.value as SingleViewBase;
+    view.setSearch('needle');
+    expect(view.rows$.value.map(row => row.rowId)).toEqual([normalRow]);
+    await wait();
+    expect(model.props.cells[malformedRow][propertyId].value).toEqual(
+      invalidValue
+    );
   }
 );
 
